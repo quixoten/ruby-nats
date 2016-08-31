@@ -1,5 +1,6 @@
 require 'uri'
 require 'securerandom'
+require 'concurrent'
 
 ep = File.expand_path(File.dirname(__FILE__))
 
@@ -349,8 +350,10 @@ module NATS
     @reconnect_timer, @needed = nil, nil
     @connected, @closing, @reconnecting, @conn_cb_called = false, false, false, false
     @msgs_received = @msgs_sent = @bytes_received = @bytes_sent = @pings = 0
+    @pending = Concurrent::AtomicReference.new(Concurrent::Array.new)
     @pending_size = 0
     @server_info = { }
+    @publish_lock = Mutex.new
 
     # Mark whether we should be connecting securely, try best effort
     # in being compatible with present ssl support.
@@ -376,6 +379,7 @@ module NATS
     @bytes_sent += msg.bytesize if msg
 
     send_command("PUB #{subject} #{opt_reply} #{msg.bytesize}#{CR_LF}#{msg}#{CR_LF}")
+
     queue_server_rt(&blk) if blk
   end
 
@@ -577,9 +581,10 @@ module NATS
   end
 
   def flush_pending #:nodoc:
-    return unless @pending
-    send_data(@pending.join)
-    @pending, @pending_size = nil, 0
+    return if @pending.get.empty?
+    p = @pending.swap(Concurrent::Array.new)
+    send_data(p.join)
+    @pending_size = 0
   end
 
   def receive_data(data) #:nodoc:
@@ -758,7 +763,7 @@ module NATS
 
     # Whip through any pending SUB commands since we replay
     # all subscriptions already done anyway.
-    @pending.delete_if { |sub| sub[0..2] == SUB_OP } if @pending
+    @pending.update { |p| p.delete_if { |sub| sub[0..2] == SUB_OP } }
     @subs.each_pair { |k, v| send_command("SUB #{v[:subject]} #{v[:queue]} #{k}#{CR_LF}") }
 
     unless user_err_cb? or reconnecting?
@@ -830,7 +835,8 @@ module NATS
     process_disconnect and return if (closing? or should_not_reconnect?)
     @reconnecting = true if connected?
     @connected = false
-    @pending = @pongs = nil
+    @pending.swap(Concurrent::Array.new)
+    @pongs = nil
     @buf = nil
     cancel_ping_timer
 
@@ -903,16 +909,17 @@ module NATS
   end
 
   def send_command(command, priority = false) #:nodoc:
-    needs_flush = (connected? && @pending.nil?)
+    needs_flush = (connected? && @pending.get.empty?)
 
-    @pending ||= []
-    @pending << command unless priority
-    @pending.unshift(command) if priority
+    @pending.update do |p|
+      priority ? p.unshift(command) : p << command
+      p
+    end
+
     @pending_size += command.bytesize
 
-    EM.next_tick { flush_pending } if needs_flush
+    EM.next_tick { flush_pending } if needs_flush || (connected? && @pending_size > MAX_PENDING_SIZE)
 
-    flush_pending if (connected? && @pending_size > MAX_PENDING_SIZE)
     if (@options[:fast_producer_error] && pending_data_size > FAST_PRODUCER_THRESHOLD)
       err_cb.call(NATS::ClientError.new("Fast Producer: #{pending_data_size} bytes outstanding"))
     end
